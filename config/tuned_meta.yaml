@@ -1,0 +1,15 @@
+dev_records:
+- '108'
+- '112'
+- '121'
+- '124'
+- '200'
+- '202'
+- '220'
+- '222'
+reference:
+  highpass_cutoff_hz: 0.5
+  mode: spline_hp
+  pr_offset_s: 0.08
+  spline_hp_cutoff_hz: 0.3
+segment_seconds: 300

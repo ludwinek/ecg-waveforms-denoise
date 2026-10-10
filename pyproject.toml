@@ -1,0 +1,13 @@
+[project]
+name = "ecgdn"
+version = "0.1.0"
+description = "Controlled comparison of ECG denoising methods (classical, adaptive, DL) incl. downstream QRS detection"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "pywavelets", "numba", "pandas", "pyyaml", "wfdb", "matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

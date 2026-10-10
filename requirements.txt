@@ -1,0 +1,9 @@
+numpy
+scipy
+pywavelets
+numba
+pandas
+pyyaml
+wfdb
+matplotlib
+pytest
