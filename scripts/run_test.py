@@ -4,6 +4,8 @@ Usage: python scripts/run_test.py data [--workers 4] [--records 100,101] [--seco
 Requires config/tuned_params.yaml + config/tuned_meta.yaml (from tune_dev.py) and config/splits.yaml.
 Noise for evaluation comes from the NSTDB TEST window (1200-1800 s); PLI is synthetic.
 Resumable: each finished record is saved to results/test_parts/; re-running skips them (use --force to redo).
+Sensitivity: add --reference raw|highpass to score the same frozen parameters against another reference
+(writes results/test_results_<mode>.csv; the main analysis is never touched).
 Output: results/test_results.csv (one row per record x noise x SNR x method),
         results/test_distortion.csv (filter-only distortion per record x noise-type-tuned method)
 """
@@ -14,7 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 import numpy as np, pandas as pd, yaml
 from ecgdn import data, methods, noise
-from ecgdn.experiment import filter_only_distortion
+from ecgdn.experiment import filter_only_distortion, make_noisy
 from ecgdn.metrics import compensate_delay, evaluate
 from ecgdn.qrs import detect_qrs, qrs_scores
 from ecgdn.reference import beat_positions, make_reference
@@ -38,8 +40,9 @@ def work(args):
     w = int(round(cfg["warmup_seconds"] * fs))
     beats = beat_positions(ann_s, ann_sym, n)
     nstdb = {k: noise.load_nstdb_noise(str(pathlib.Path(data_dir) / "nstdb"), k)[0] for k in NT_REAL}
-    rows = [{"record": rec, "noise": "none", "snr_target": np.nan, "method": "reference",
-             **qrs_scores(beats, detect_qrs(ref, fs), fs, w, n - w)}]
+    skip_qrs = cfg.get("_skip_qrs", False)
+    Q = (lambda sig: {}) if skip_qrs else (lambda sig: qrs_scores(beats, detect_qrs(sig, fs), fs, w, n - w))
+    rows = [{"record": rec, "noise": "none", "snr_target": np.nan, "method": "reference", **Q(ref)}]
     drows = []
     for ni, nt in enumerate(cfg["noise_types"]):
         ov = overrides_for(tuned, nt)
@@ -48,10 +51,7 @@ def work(args):
                 for d in filter_only_distortion(ref, fs, [m], cfg["warmup_seconds"], cfg["metrics"]["remove_dc"], ov):
                     drows.append({"record": rec, "noise": nt, **d})
         for si, snr in enumerate(cfg["snr_in_db"]):
-            rng = np.random.default_rng([seed, int(rec), ni, si, 1])
-            rawn = (noise.synth_pli(n, fs, rng, **{k: cfg["pli"][k] for k in ("f0", "harmonic_amp", "freq_drift_hz", "am_depth")})
-                    if nt == "pli" else noise.nstdb_segment(nstdb[nt], fs, n, cfg["nstdb"]["test_seconds"], rng))
-            noisy, v = noise.add_noise(ref, rawn, snr)
+            noisy, v, rng = make_noisy(ref, nt, snr, rec, ni, si, fs, cfg, nstdb)
             ctx = {"noise_type": nt, "oracle_ref": noise.oracle_reference(v, cfg["oracle_reference"]["snr_ref_db"], rng)}
             for m in names:
                 if not methods.applicable(m, nt):
@@ -61,7 +61,7 @@ def work(args):
                     out = compensate_delay(ref, out)
                 rows.append({"record": rec, "noise": nt, "snr_target": snr, "method": m,
                              **evaluate(ref, noisy, out, fs, cfg["warmup_seconds"], cfg["metrics"]["remove_dc"]),
-                             **qrs_scores(beats, detect_qrs(out, fs), fs, w, n - w)})
+                             **Q(out)})
     return rows, drows
 
 
@@ -73,11 +73,20 @@ def main():
     ap.add_argument("--seconds", type=float, default=None, help="segment length override (testing only)")
     ap.add_argument("--out", default="results/test_results.csv")
     ap.add_argument("--force", action="store_true", help="ignore saved per-record parts and recompute")
+    ap.add_argument("--reference", default=None, choices=["spline", "spline_hp", "highpass", "raw"],
+                    help="SENSITIVITY ANALYSIS: evaluate the FROZEN parameters against another reference mode "
+                         "(separate output files; QRS detection skipped unless --qrs)")
+    ap.add_argument("--qrs", action="store_true", help="with --reference: also run QRS detection")
     a = ap.parse_args()
     cfg = yaml.safe_load(open(ROOT / "config" / "protocol.yaml"))
     tuned = yaml.safe_load(open(ROOT / "config" / "tuned_params.yaml"))
     meta = yaml.safe_load(open(ROOT / "config" / "tuned_meta.yaml"))
-    if meta["reference"] != cfg["reference"]:
+    sens = a.reference is not None
+    if sens:
+        cfg["reference"]["mode"] = a.reference
+        cfg["_skip_qrs"] = not a.qrs
+        print(f"SENSITIVITY RUN: frozen parameters (tuned with {meta['reference']['mode']}) evaluated against reference '{a.reference}'")
+    elif meta["reference"] != cfg["reference"]:
         sys.exit(f"ABORT: parameters were tuned with reference {meta['reference']}, protocol says {cfg['reference']}. Re-tune.")
     seconds = a.seconds or cfg["segment_seconds"]
     if a.seconds is None and meta["segment_seconds"] != seconds:
@@ -89,10 +98,11 @@ def main():
     assert not set(recs) & set(sp["dev"]), "dev record in test set!"
     names = list(methods.REGISTRY)
     print(f"test records: {len(recs)}; reference mode: {cfg['reference']['mode']}")
-    parts = ROOT / "results" / "test_parts"
+    parts = ROOT / "results" / ("test_parts" if not sens else f"test_parts_{a.reference}")
     parts.mkdir(parents=True, exist_ok=True)
     fp = hashlib.sha256(json.dumps({"ref": cfg["reference"], "tuned": tuned, "seconds": seconds, "names": names,
-                                    "snr": cfg["snr_in_db"], "noise": cfg["noise_types"], "seed": cfg["seed"]},
+                                    "snr": cfg["snr_in_db"], "noise": cfg["noise_types"], "seed": cfg["seed"],
+                                    "skip_qrs": cfg.get("_skip_qrs", False)},
                                    sort_keys=True, default=str).encode()).hexdigest()
     fp_file = parts / "_fingerprint.txt"
     if fp_file.exists() and fp_file.read_text() != fp and not a.force:
@@ -119,11 +129,12 @@ def main():
     missing = [r for r in recs if not (parts / f"{r}.csv").exists()]
     if missing:
         sys.exit(f"INCOMPLETE - missing records: {missing}. Fix the error above and re-run to resume.")
-    out = ROOT / a.out
+    out_name = a.out if not (sens and a.out == "results/test_results.csv") else f"results/test_results_{a.reference}.csv"
+    out = ROOT / out_name
     out.parent.mkdir(exist_ok=True)
     pd.concat([pd.read_csv(parts / f"{r}.csv", dtype={"record": str}) for r in recs], ignore_index=True).to_csv(out, index=False)
     pd.concat([pd.read_csv(parts / f"{r}_dist.csv", dtype={"record": str}) for r in recs], ignore_index=True).to_csv(
-        out.with_name("test_distortion.csv"), index=False)
+        out.with_name("test_distortion.csv" if not sens else f"test_distortion_{a.reference}.csv"), index=False)
     print("wrote", out)
 
 

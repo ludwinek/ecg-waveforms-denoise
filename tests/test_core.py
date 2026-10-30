@@ -165,3 +165,38 @@ def test_dwt_threshold_scale_monotone_shrinkage(ecg):
     base = dict(wavelet="db6", level=8, thr_levels=(1, 2, 3, 4, 5), mode="soft")
     e = [np.sum(np.abs(classical.dwt_denoise(noisy, **base, thr_scale=s))) for s in (0.3, 0.6, 1.0)]
     assert e[0] >= e[1] >= e[2]
+
+
+# ------------------------------------------------------------------ DL data side (numpy only)
+def test_dl_overlap_add_identity_reconstructs_signal():
+    from ecgdn.dl_data import denoise_signal
+    rng = np.random.default_rng(16)
+    x, _ = synth.synth_ecg(30, FS, rng, dc=1.0)
+    y = denoise_signal(lambda a: a, x)               # identity "model"
+    assert metrics.prd(x - x.mean(), y) < 0.01       # identity model -> exact reconstruction
+
+
+def test_dl_sampler_realises_requested_snr_and_normalisation():
+    from ecgdn.dl_data import NoiseBank, TrainSampler
+    rng = np.random.default_rng(17)
+    ref, _ = synth.synth_ecg(120, FS, rng)
+    bank = NoiseBank({k: noise.SYNTH_STANDINS[k](int(FS * 300), FS, rng) for k in ("bw", "em", "ma")},
+                     np.stack([noise.synth_pli(int(FS * 100), FS, rng) for _ in range(3)]))
+    sm = TrainSampler([ref], bank, snr_range=(10.0, 10.0))
+    X, Y = sm.batch(64, np.random.default_rng(1))
+    assert X.shape == (64, 1, 720) and X.dtype == np.float32
+    assert np.allclose(X.std(axis=2), 1.0, atol=1e-3)            # normalised by noisy std
+    err = X - Y                                                   # = noise / sd
+    snr = 10 * np.log10((Y ** 2).mean(axis=2) / (err ** 2).mean(axis=2))   # power incl. window offset
+    assert np.allclose(snr, 10.0, atol=1e-3)
+
+
+def test_make_noisy_is_deterministic_and_verified():
+    from ecgdn.experiment import make_noisy
+    import yaml, pathlib
+    cfg = yaml.safe_load(open(pathlib.Path(__file__).resolve().parents[1] / "config" / "protocol.yaml"))
+    rng = np.random.default_rng(18)
+    ref, _ = synth.synth_ecg(60, FS, rng)
+    a, v1, _ = make_noisy(ref, "pli", 5, "100", 3, 1, FS, cfg, {})
+    b, v2, _ = make_noisy(ref, "pli", 5, "100", 3, 1, FS, cfg, {})
+    assert np.array_equal(a, b) and abs(metrics.snr_db(ref, a) - 5) < 1e-6

@@ -6,7 +6,7 @@ import numpy as np
 
 from . import methods
 from .metrics import compensate_delay, evaluate, prd, snr_db
-from .noise import add_noise, oracle_reference
+from .noise import add_noise, nstdb_segment, oracle_reference, synth_pli
 
 NO_ORACLE_NEEDED = [m for m in methods.REGISTRY if "oracle" not in m]
 
@@ -48,3 +48,23 @@ def filter_only_distortion(ref_ecg, fs, method_names=None, warmup_s=10.0,
                      "prd_noise_free": prd(ref_ecg[w:-w], out[w:-w], remove_dc),
                      "snr_noise_free": snr_db(ref_ecg[w:-w], out[w:-w], remove_dc)})
     return rows
+
+
+NT_REAL = ("bw", "em", "ma")
+
+
+def make_noisy(ref, noise_type, snr, rec, ni, si, fs, cfg, nstdb):
+    """Single source of truth for the evaluation noisy signal of (record, noise type, SNR).
+
+    Used by run_test.py (classical/adaptive methods) AND run_dl.py, so every method sees
+    bit-identical input. Returns (noisy, scaled_noise, rng); the rng state is the one the
+    oracle reference is drawn from afterwards.
+    """
+    rng = np.random.default_rng([cfg["seed"], int(rec), ni, si, 1])
+    n = len(ref)
+    if noise_type == "pli":
+        raw = synth_pli(n, fs, rng, **{k: cfg["pli"][k] for k in ("f0", "harmonic_amp", "freq_drift_hz", "am_depth")})
+    else:
+        raw = nstdb_segment(nstdb[noise_type], fs, n, cfg["nstdb"]["test_seconds"], rng)
+    noisy, v = add_noise(ref, raw, snr)
+    return noisy, v, rng

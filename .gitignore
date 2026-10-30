@@ -1,0 +1,10 @@
+
+/results/
+/data/
+/models/
+.venv/
+__pycache__/
+*.pyc
+*.nbc
+*.nbi
+.pytest_cache/
